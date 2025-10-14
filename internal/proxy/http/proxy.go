@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -46,8 +47,10 @@ type Proxy struct {
 	ActionURL *url.URL
 
 	server    *http.Server
+	client    *http.Client
 	transport *http.Transport
 
+	// Reverse proxies are used for Upgrade (WebSocket) requests.
 	targetRP *httputil.ReverseProxy
 	actionRP *httputil.ReverseProxy
 }
@@ -82,12 +85,12 @@ func NewProxy(
 		ActionURL: action,
 	}
 
-	// Shared transport for both target and action reverse proxies.
-	// Tuned for long-lived WebSocket/streaming connections.
+	// Shared transport for both manual HTTP client and ReverseProxy.
+	// Tuned for long-lived connections and streaming.
 	p.transport = &http.Transport{
 		Proxy:               http.ProxyFromEnvironment,
 		DialContext:         (&net.Dialer{Timeout: baseProxy.Config.Timeout, KeepAlive: 30 * time.Second}).DialContext,
-		ForceAttemptHTTP2:   true, // harmless for WS (handled via H1), beneficial for normal requests
+		ForceAttemptHTTP2:   true, // harmless for WS (handled via H1), good for normal requests
 		TLSHandshakeTimeout: 10 * time.Second,
 		// ResponseHeaderTimeout protects only the initial response headers (e.g., WS handshake).
 		ResponseHeaderTimeout: 10 * time.Second,
@@ -98,10 +101,13 @@ func NewProxy(
 		TLSClientConfig:       baseProxy.TLSConfig,
 	}
 
-	// Build reverse proxies for target and (optional) action endpoints.
-	p.targetRP = p.buildReverseProxy(p.TargetURL)
-	if p.ActionURL != nil {
-		p.actionRP = p.buildReverseProxy(p.ActionURL)
+	p.client = &http.Client{
+		Transport: p.transport,
+		// Do not set a global timeout here; it would kill long-lived streams/WS.
+		Timeout: 0,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
 	}
 
 	// HTTP server tuned for long-lived upgraded connections:
@@ -115,6 +121,12 @@ func NewProxy(
 		IdleTimeout:       0, // irrelevant for upgraded connections; 0 = no timeout
 		Handler:           p.getHandler(),
 		TLSConfig:         p.TLSConfig,
+	}
+
+	// Build reverse proxies for target and (optional) action endpoints.
+	p.targetRP = p.buildReverseProxy(p.TargetURL)
+	if p.ActionURL != nil {
+		p.actionRP = p.buildReverseProxy(p.ActionURL)
 	}
 
 	// When action is "drop" we need Hijack on H1; Go's H2 server does not support Hijack.
@@ -140,6 +152,7 @@ func (p *Proxy) Shutdown(ctx context.Context) error {
 		return fmt.Errorf("can't shutdown server: %w", err)
 	}
 	// Close idle backend connections (includes WS backends if gracefully closed).
+	p.client.CloseIdleConnections()
 	p.transport.CloseIdleConnections()
 
 	done := make(chan any, 1)
@@ -162,15 +175,22 @@ func (p *Proxy) buildReverseProxy(target *url.URL) *httputil.ReverseProxy {
 	logger := p.Logger
 
 	director := func(req *http.Request) {
+		// Preserve original client metadata before rewriting
+		origHost := req.Host
+		origProto := "http"
+		if req.TLS != nil {
+			origProto = "https"
+		}
+
 		// Rewrite to target
 		req.URL.Scheme = target.Scheme
 		req.URL.Host = target.Host
 		req.URL.Path = singleJoiningSlash(target.Path, req.URL.Path)
-		// Keep existing RawQuery; ReverseProxy merges query correctly
+		// Backend virtual host should be the target host
 		req.Host = target.Host
 
-		// Forwarding headers (XFF/XFH/XFP)
-		setForwardHeaders(req, req.Context())
+		// Set forwarding headers with ORIGINAL values
+		setForwardHeadersOn(req, req.Context(), origHost, origProto, getClientIPFromCtx(req.Context()))
 
 		// Remove Accept-Encoding to avoid decompression/recompression pitfalls for streaming.
 		req.Header.Del("Accept-Encoding")
@@ -196,6 +216,88 @@ func (p *Proxy) buildReverseProxy(target *url.URL) *httputil.ReverseProxy {
 	return rp
 }
 
+// proxyRequest forwards a non-upgrade HTTP request using the manual client path.
+// It keeps original client metadata for X-Forwarded-* headers and ensures
+// the incoming body does not block the connection on errors.
+func (p *Proxy) proxyRequest(
+	dst *url.URL,
+	w http.ResponseWriter,
+	r *http.Request,
+	e wrapper.Entity,
+	logger zerolog.Logger,
+) {
+	// Preserve original client values
+	origHost := r.Host
+	origProto := "http"
+	if r.TLS != nil {
+		origProto = "https"
+	}
+
+	// IMPORTANT for your WrapHTTPBody: Close() on Body resets the reader to start.
+	// Reset to beginning so filters that read the body do not consume it for upstream.
+	if r.Body != nil {
+		_ = r.Body.Close()
+	}
+
+	// Build outbound URL
+	outURL := *r.URL
+	outURL.Scheme = dst.Scheme
+	outURL.Host = dst.Host
+	outURL.Path = singleJoiningSlash(dst.Path, r.URL.Path)
+
+	// Build outbound request with the (reset) body
+	outReq, err := http.NewRequestWithContext(r.Context(), r.Method, outURL.String(), r.Body)
+	if err != nil {
+		logger.Error().Err(err).Msg("build outbound request failed")
+		handleError(w)
+		return
+	}
+
+	// Copy headers
+	outReq.Header = make(http.Header, len(r.Header))
+	for k, vv := range r.Header {
+		for _, v := range vv {
+			outReq.Header.Add(k, v)
+		}
+	}
+
+	// Simplify streaming
+	outReq.Header.Del("Accept-Encoding")
+
+	// Backend virtual host should be the target host
+	outReq.Host = dst.Host
+
+	// Set forwarding headers with ORIGINAL values
+	setForwardHeadersOn(outReq, r.Context(), origHost, origProto, e.GetIP().String())
+
+	// Perform request
+	resp, err := p.client.Do(outReq)
+	if err != nil {
+		logger.Error().Err(err).Msg("proxy upstream error")
+		handleError(w)
+		// Drain/close the original request body to keep the client connection healthy
+		if r.Body != nil {
+			_, _ = io.Copy(io.Discard, r.Body)
+			_ = r.Body.Close()
+		}
+		return
+	}
+	defer resp.Body.Close()
+
+	// Copy response headers
+	for k, vals := range resp.Header {
+		for _, v := range vals {
+			w.Header().Add(k, v)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+
+	// Stream response body
+	if _, err := io.Copy(w, resp.Body); err != nil && !isProbableClientClose(err) {
+		logger.Error().Err(err).Msg("copy response body failed")
+	}
+}
+
 func (p *Proxy) processVerdict(
 	w http.ResponseWriter,
 	r *http.Request,
@@ -204,18 +306,15 @@ func (p *Proxy) processVerdict(
 ) {
 	switch p.Config.RuleSettings.RejectAction {
 	case common.RejectActionProxy:
-		if p.actionRP == nil {
-			logger.Error().Msg("RejectActionProxy configured but actionRP is nil")
-			handleError(w)
-			return
+		if isWebSocketRequest(r) && p.actionRP != nil {
+			// Inject client IP into context for forwarding headers in Director
+			r = r.WithContext(context.WithValue(r.Context(), ctxKeyClientIP, e.GetIP().String()))
+			p.actionRP.ServeHTTP(w, r)
+		} else {
+			p.proxyRequest(p.ActionURL, w, r, e, logger)
 		}
-		// Inject client IP into context for header forwarding in Director.
-		r = r.WithContext(context.WithValue(r.Context(), ctxKeyClientIP, e.GetIP().String()))
-		p.actionRP.ServeHTTP(w, r)
-
 	case common.RejectActionRedirect:
 		http.Redirect(w, r, p.ActionURL.String(), http.StatusMovedPermanently)
-
 	case common.RejectActionDrop:
 		hj, ok := w.(http.Hijacker)
 		if !ok {
@@ -231,11 +330,14 @@ func (p *Proxy) processVerdict(
 			return
 		}
 		_ = conn.Close()
-
 	default:
 		logger.Warn().Msg("Request was filtered, but action is none")
-		r = r.WithContext(context.WithValue(r.Context(), ctxKeyClientIP, e.GetIP().String()))
-		p.targetRP.ServeHTTP(w, r)
+		if isWebSocketRequest(r) {
+			r = r.WithContext(context.WithValue(r.Context(), ctxKeyClientIP, e.GetIP().String()))
+			p.targetRP.ServeHTTP(w, r)
+		} else {
+			p.proxyRequest(p.TargetURL, w, r, e, logger)
+		}
 	}
 }
 
@@ -245,7 +347,10 @@ func (p *Proxy) createEntity(r *http.Request) (wrapper.Entity, error) {
 	if err != nil {
 		return nil, fmt.Errorf("can't wrap body: %w", err)
 	}
-	r.Header.Set("Host", r.Host)
+
+	// IMPORTANT:
+	// Do NOT write "Host" into the header map. The request host is r.Host.
+	// Setting r.Header["Host"] leads to inconsistent behavior and parsing issues.
 
 	e := &wrapper.HTTPRequest{Request: r}
 	return e, nil
@@ -272,61 +377,78 @@ func (p *Proxy) getHandler() http.HandlerFunc {
 			return
 		}
 
-		// Normal proxy path (covers WebSockets and other upgrades automatically).
-		r = r.WithContext(context.WithValue(r.Context(), ctxKeyClientIP, e.GetIP().String()))
-		p.targetRP.ServeHTTP(w, r)
+		// WebSocket/Upgrade → ReverseProxy (handles hijack/upgrade correctly)
+		if isWebSocketRequest(r) {
+			r = r.WithContext(context.WithValue(r.Context(), ctxKeyClientIP, e.GetIP().String()))
+			p.targetRP.ServeHTTP(w, r)
+			return
+		}
+
+		// Normal HTTP → manual path
+		p.proxyRequest(p.TargetURL, w, r, e, logger)
 	}
 }
 
 func (p *Proxy) serve() {
 	defer p.WG.Done()
 
-	// Use a listener with TCP keepalive to help long-lived connections survive NAT/LB idling.
-	lc := net.ListenConfig{
-		KeepAlive: 30 * time.Second,
-	}
-
-	ln, err := lc.Listen(context.Background(), "tcp", p.Config.ListenAddr)
-	if err != nil {
-		p.Logger.Fatal().Err(err).Msg("listen failed")
+	// Use Listen/Serve manually to respect TLS config and keep long-lived connections stable.
+	if p.TLSConfig != nil {
+		p.server.TLSConfig = p.TLSConfig
+		if err := p.server.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
+			p.Logger.Fatal().Err(err).Msg("unexpected server error")
+		}
 		return
 	}
 
-	// Wrap with TLS if configured.
-	if p.TLSConfig != nil {
-		ln = tls.NewListener(ln, p.TLSConfig)
-	}
-
-	// Serve (instead of ListenAndServe) to use our custom listener.
-	if err := p.server.Serve(ln); err != nil && err != http.ErrServerClosed {
+	if err := p.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		p.Logger.Fatal().Err(err).Msg("unexpected server error")
 	}
 }
 
 // ----- Helpers -----
 
-// setForwardHeaders sets common reverse-proxy headers (X-Forwarded-For/Host/Proto).
-func setForwardHeaders(r *http.Request, ctx context.Context) {
+func isWebSocketRequest(r *http.Request) bool {
+	// Must have "Connection: Upgrade" and "Upgrade: websocket" (case-insensitive, comma handling)
+	conn := r.Header.Get("Connection")
+	upg := r.Header.Get("Upgrade")
+	if upg == "" || !strings.EqualFold(strings.TrimSpace(upg), "websocket") {
+		return false
+	}
+	// "Connection" can be a comma-separated list; check for token "upgrade"
+	for _, t := range strings.Split(conn, ",") {
+		if strings.EqualFold(strings.TrimSpace(t), "upgrade") {
+			return true
+		}
+	}
+	return false
+}
+
+// setForwardHeadersOn sets X-Forwarded-* headers using ORIGINAL client-facing values.
+func setForwardHeadersOn(r *http.Request, ctx context.Context, origHost, origProto, clientIP string) {
 	// X-Forwarded-For
-	if ip, _ := ctx.Value(ctxKeyClientIP).(string); ip != "" {
+	if clientIP != "" {
 		if prior := r.Header.Get("X-Forwarded-For"); prior != "" {
-			r.Header.Set("X-Forwarded-For", prior+","+ip)
+			r.Header.Set("X-Forwarded-For", prior+","+clientIP)
 		} else {
-			r.Header.Set("X-Forwarded-For", ip)
+			r.Header.Set("X-Forwarded-For", clientIP)
 		}
 	}
-	// X-Forwarded-Proto
+	// X-Forwarded-Proto: original client→proxy scheme
 	if r.Header.Get("X-Forwarded-Proto") == "" {
-		if r.TLS != nil {
-			r.Header.Set("X-Forwarded-Proto", "https")
-		} else {
-			r.Header.Set("X-Forwarded-Proto", "http")
-		}
+		r.Header.Set("X-Forwarded-Proto", origProto)
 	}
-	// X-Forwarded-Host
-	if r.Header.Get("X-Forwarded-Host") == "" {
-		r.Header.Set("X-Forwarded-Host", r.Host)
+	// X-Forwarded-Host: original Host header seen by proxy
+	if r.Header.Get("X-Forwarded-Host") == "" && origHost != "" {
+		r.Header.Set("X-Forwarded-Host", origHost)
 	}
+}
+
+func getClientIPFromCtx(ctx context.Context) string {
+	if ip, _ := ctx.Value(ctxKeyClientIP).(string); ip != "" {
+		return ip
+	}
+	return ""
 }
 
 // singleJoiningSlash joins two URL paths with a single slash between them.
