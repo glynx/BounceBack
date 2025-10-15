@@ -308,6 +308,10 @@ func (f *MallebaleRule) verifyHTTPProfile(
 	)
 
 	for _, transform := range transforms {
+		if len(transform) == 0 {
+        	logger.Debug().Msg("empty transform chain encountered; skipping")
+        	continue
+    	}
 		last := transform[len(transform)-1]
 		switch last.Func {
 		case "header":
