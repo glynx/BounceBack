@@ -140,19 +140,18 @@ func (p *Proxy) GetLogger() *zerolog.Logger {
 }
 
 // RunFilters return true if entity passed all checks and false if filtered.
-func (p *Proxy) RunFilters(e wrapper.Entity, logger zerolog.Logger) bool {
+func (p *Proxy) RunFilters(e wrapper.Entity, logger zerolog.Logger) (bool, string) {
 	ip := e.GetIP().String()
 
 	if p.isRejectedByThreshold(ip, logger) {
-		return false
+		return false, ""
 	}
 
 	mg := p.prepareRules(e, logger)
-
+	var acceptTarget string
 	// TODO: cache filters for equal entities for optimization.
 	for i, f := range p.Config.Filters {
 		mg[i].Lock()
-		defer mg[i].Unlock()
 
 		ruleLogger := logger.With().Str("rule", f.Rule).Logger()
 		rule, _ := p.rules.Get(f.Rule)
@@ -161,23 +160,32 @@ func (p *Proxy) RunFilters(e wrapper.Entity, logger zerolog.Logger) bool {
 		fired, err := rule.Apply(e, ruleLogger)
 		if err != nil {
 			ruleLogger.Error().Err(err).Msg("Rule error, skipping...")
+			mg[i].Unlock()
 			continue
 		}
 
 		if !fired {
+			mg[i].Unlock()
 			continue
 		}
 
-		ruleLogger.Warn().Str("action", f.Action).Msg("Running action")
+		acceptTarget = f.Target
+		log := ruleLogger.Warn().Str("action", f.Action)
+		if acceptTarget != "" {
+			log.Str("per_filter_target", acceptTarget)
+		}
+		log.Msg("Running action")
 		if f.Action == common.FilterActionReject {
 			err = p.db.IncRejects(ip)
 			if err != nil {
 				logger.Error().Err(err).Msg("Can't increase rejects")
 			}
-			return false
+			mg[i].Unlock()
+			return false, ""
 		}
 
 		// accept action
+		mg[i].Unlock()
 		break
 	}
 
@@ -187,7 +195,7 @@ func (p *Proxy) RunFilters(e wrapper.Entity, logger zerolog.Logger) bool {
 		logger.Error().Err(err).Msg("Can't increase accepts")
 	}
 
-	return true
+	return true, acceptTarget
 }
 
 // check NoRejectThreshold and RejectThreshold.

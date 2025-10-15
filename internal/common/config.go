@@ -37,6 +37,7 @@ type RuleSettings struct {
 type Filter struct {
 	Rule   string `mapstructure:"rule"`
 	Action string `mapstructure:"action"`
+	Target string  `yaml:"target,omitempty"`
 }
 
 type ProxyConfig struct {

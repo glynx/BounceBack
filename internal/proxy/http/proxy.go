@@ -10,6 +10,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/D00Movenok/BounceBack/internal/common"
@@ -51,8 +52,7 @@ type Proxy struct {
 	transport *http.Transport
 
 	// Reverse proxies are used for Upgrade (WebSocket) requests.
-	targetRP *httputil.ReverseProxy
-	actionRP *httputil.ReverseProxy
+	rpCache  sync.Map // key: string(targetURL), val: *httputil.ReverseProxy
 }
 
 func NewProxy(
@@ -124,9 +124,9 @@ func NewProxy(
 	}
 
 	// Build reverse proxies for target and (optional) action endpoints.
-	p.targetRP = p.buildReverseProxy(p.TargetURL)
+	_ = p.buildReverseProxy(p.TargetURL)
 	if p.ActionURL != nil {
-		p.actionRP = p.buildReverseProxy(p.ActionURL)
+		_ = p.buildReverseProxy(p.ActionURL)
 	}
 
 	// When action is "drop" we need Hijack on H1; Go's H2 server does not support Hijack.
@@ -213,6 +213,25 @@ func (p *Proxy) buildReverseProxy(target *url.URL) *httputil.ReverseProxy {
 		},
 	}
 
+	return rp
+}
+
+// getReverseProxy returns the ReverseProxy for the destination (either cached or created)
+func (p *Proxy) getReverseProxy(dst *url.URL) *httputil.ReverseProxy {
+	if dst == nil || dst.String() == "" {
+		return nil
+	}
+
+	key := dst.String()
+	if v, ok := p.rpCache.Load(key); ok {
+		return v.(*httputil.ReverseProxy)
+	}
+	// build
+	rp := p.buildReverseProxy(dst)
+	// Double-checked store 
+	if v, loaded := p.rpCache.LoadOrStore(key, rp); loaded {
+		return v.(*httputil.ReverseProxy)
+	}
 	return rp
 }
 
@@ -304,12 +323,13 @@ func (p *Proxy) processVerdict(
 	e wrapper.Entity,
 	logger zerolog.Logger,
 ) {
+	actionRP := p.getReverseProxy(p.ActionURL)
 	switch p.Config.RuleSettings.RejectAction {
 	case common.RejectActionProxy:
-		if isWebSocketRequest(r) && p.actionRP != nil {
+		if isWebSocketRequest(r) && actionRP != nil {
 			// Inject client IP into context for forwarding headers in Director
 			r = r.WithContext(context.WithValue(r.Context(), ctxKeyClientIP, e.GetIP().String()))
-			p.actionRP.ServeHTTP(w, r)
+			actionRP.ServeHTTP(w, r)
 		} else {
 			p.proxyRequest(p.ActionURL, w, r, e, logger)
 		}
@@ -333,8 +353,9 @@ func (p *Proxy) processVerdict(
 	default:
 		logger.Warn().Msg("Request was filtered, but action is none")
 		if isWebSocketRequest(r) {
+			targetRP := p.getReverseProxy(p.TargetURL)
 			r = r.WithContext(context.WithValue(r.Context(), ctxKeyClientIP, e.GetIP().String()))
-			p.targetRP.ServeHTTP(w, r)
+			targetRP.ServeHTTP(w, r)
 		} else {
 			p.proxyRequest(p.TargetURL, w, r, e, logger)
 		}
@@ -372,20 +393,35 @@ func (p *Proxy) getHandler() http.HandlerFunc {
 		logRequest(e, logger)
 
 		// Apply filters/rules first.
-		if !p.RunFilters(e, logger) {
+		isAllowed, target := p.RunFilters(e, logger)
+		if !isAllowed {
 			p.processVerdict(w, r, e, logger)
 			return
 		}
 
+		var targetUrl *url.URL
+		if strings.TrimSpace(target) != "" {
+			u, err := url.Parse(target)
+			if err != nil || u.Scheme == "" || u.Host == "" {
+				logger.Warn().Str("target", target).Msg("invalid accept target; falling back to default")
+				targetUrl = p.TargetURL
+			} else {
+				targetUrl = u
+			}
+		} else {
+			targetUrl = p.TargetURL
+		}
+
 		// WebSocket/Upgrade → ReverseProxy (handles hijack/upgrade correctly)
 		if isWebSocketRequest(r) {
+			targetRP := p.getReverseProxy(targetUrl)
 			r = r.WithContext(context.WithValue(r.Context(), ctxKeyClientIP, e.GetIP().String()))
-			p.targetRP.ServeHTTP(w, r)
+			targetRP.ServeHTTP(w, r)
 			return
 		}
 
 		// Normal HTTP → manual path
-		p.proxyRequest(p.TargetURL, w, r, e, logger)
+		p.proxyRequest(targetUrl, w, r, e, logger)
 	}
 }
 

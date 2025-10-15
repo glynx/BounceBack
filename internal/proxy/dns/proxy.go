@@ -187,12 +187,25 @@ func (p *Proxy) getHandler(t string) dns.HandlerFunc {
 			Request: r,
 			From:    from,
 		}
-		if !p.RunFilters(e, logger) {
+		isAllowed, acceptTarget := p.RunFilters(e, logger)
+		if !isAllowed {
 			p.processVerdict(w, r, logger)
 			return
 		}
-
-		p.proxyRequest(p.TargetURL, w, r, logger)
+		
+		var target netip.AddrPort
+		if acceptTarget != "" {
+			var err error
+			target, err = netip.ParseAddrPort(acceptTarget)
+			if err != nil {
+				logger.Warn().Msgf("can't parse AddrPort: %s", err)
+				target = p.TargetURL
+			} 
+		} else {
+			target = p.TargetURL
+		}
+		
+		p.proxyRequest(target, w, r, logger)
 	}
 }
 

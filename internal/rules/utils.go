@@ -1,9 +1,7 @@
 package rules
 
 import (
-	"bufio"
 	"fmt"
-	"os"
 	"regexp"
 	"strings"
 
@@ -32,29 +30,19 @@ func prepareMany(
 	return eg.Wait() //nolint: wrapcheck // wrapped above
 }
 
-// parses regexp list (one regexp per line) removing content.
-func getRegexpList(path string) ([]*regexp.Regexp, error) {
+// compile a list of pattern strings
+func compileRegexpList(patternsStrings []string) ([]*regexp.Regexp, error) {
 	var (
-		re *regexp.Regexp
-		l  []*regexp.Regexp
+		re  *regexp.Regexp
+		l   []*regexp.Regexp
+		err error
 	)
-
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, fmt.Errorf("can't open regexp file: %w", err)
-	}
-
-	s := bufio.NewScanner(file)
-	for s.Scan() {
-		line := s.Text()
-		line, _, _ = strings.Cut(line, "#") // remove comment
-		if line != "" {
-			re, err = regexp.Compile(line)
-			if err != nil {
-				return nil, fmt.Errorf("can't parse regexp: %w", err)
-			}
-			l = append(l, re)
+	for _, patternString := range patternsStrings {
+		re, err = regexp.Compile(patternString)
+		if err != nil {
+			return nil, fmt.Errorf("can't parse regexp: %w", err)
 		}
+		l = append(l, re)
 	}
 
 	return l, nil

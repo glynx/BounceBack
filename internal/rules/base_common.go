@@ -1,13 +1,11 @@
 package rules
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
 	"maps"
 	"net/netip"
-	"os"
 	"reflect"
 	"regexp"
 	"slices"
@@ -37,20 +35,25 @@ func NewRegexpRule(
 ) (Rule, error) {
 	var params RegexpParams
 
-	err := mapstructure.Decode(cfg.Params, &params)
+	err := common.DecodeParams(cfg.Params, &params)
 	if err != nil {
 		return nil, fmt.Errorf("can't decode params: %w", err)
 	}
 
-	rule := &RegexpRule{
-		path: params.Path,
+	patternsStrings, err := params.List.Resolve()
+	if err != nil {
+		return nil, fmt.Errorf("invalid list attribute: %w", err)
 	}
 
-	rule.list, err = getRegexpList(params.Path)
+	rule := &RegexpRule{
+		path: params.List.Origin(),
+	}
+
+	rule.list, err = compileRegexpList(patternsStrings)
 	if err != nil {
 		return nil, fmt.Errorf("can't create regexp list: %w", err)
 	}
-
+	
 	return rule, nil
 }
 
@@ -66,41 +69,32 @@ func NewIPRule(
 		ip     netip.Addr
 	)
 
-	err := mapstructure.Decode(cfg.Params, &params)
+	err := common.DecodeParams(cfg.Params, &params)
 	if err != nil {
 		return nil, fmt.Errorf("can't decode params: %w", err)
 	}
 
 	rule := &IPRule{
-		path: params.Path,
+		path: params.List.Origin(),
 	}
 
-	file, err := os.Open(params.Path)
+	lines, err := params.List.Resolve()
 	if err != nil {
-		return nil, fmt.Errorf("can't open ip list file: %w", err)
+		return nil, fmt.Errorf("invalid list attribute: %w", err)
 	}
-
-	s := bufio.NewScanner(file)
-	for s.Scan() {
-		line := s.Text()
-		line, _, _ = strings.Cut(line, "#") // remove comment
-		line = strings.TrimSpace(line)      // trim spaces
-		if line != "" {
-			ip, err = netip.ParseAddr(line)
-			if err == nil {
-				if ip.Is4() {
-					line += "/32"
-				} else {
-					line += "/128"
-				}
+	
+	for _, line := range lines {
+		ip, err = netip.ParseAddr(line)
+		if err == nil {
+			if ip.Is4() {
+				line += "/32"
+			} else {
+				line += "/128"
 			}
+		}
 
-			subnet, err = netip.ParsePrefix(line)
-			rule.subnetBanlist = append(rule.subnetBanlist, subnet)
-		}
-		if err != nil {
-			return nil, fmt.Errorf("can't parse ip/subnet: %w", err)
-		}
+		subnet, err = netip.ParsePrefix(line)
+		rule.subnetBanlist = append(rule.subnetBanlist, subnet)
 	}
 
 	// sort and remove equal elements for subnetBanlist
@@ -189,7 +183,7 @@ func NewGeolocationRule(
 	gloals common.Globals,
 ) (Rule, error) {
 	var params GeoParams
-	err := mapstructure.Decode(cfg.Params, &params)
+	err := common.DecodeParams(cfg.Params, &params)
 	if err != nil {
 		return nil, fmt.Errorf("can't decode params: %w", err)
 	}
@@ -210,7 +204,7 @@ func NewGeolocationRule(
 
 	rule := &GeoRule{
 		db:         db,
-		path:       params.Path,
+		path:       params.List.Origin(),
 		geo:        make([]*GeoRegexp, 0, len(params.Geolocations)),
 		apicounter: atomic.NewInt32(0),
 		fetchers: []GeoFetcher{
@@ -219,11 +213,14 @@ func NewGeolocationRule(
 		},
 	}
 
-	if params.Path != "" {
-		rule.list, err = getRegexpList(params.Path)
-		if err != nil {
-			return nil, fmt.Errorf("can't create regexp list: %w", err)
-		}
+	patternsStrings, err := params.List.Resolve()
+	if err != nil {
+		return nil, fmt.Errorf("invalid list attribute: %w", err)
+	}
+
+	rule.list, err = compileRegexpList(patternsStrings)
+	if err != nil {
+		return nil, fmt.Errorf("can't create regexp list: %w", err)
 	}
 
 	var re *regexp.Regexp
@@ -279,7 +276,7 @@ func NewReverseLookupRule(
 		dns    netip.AddrPort
 	)
 
-	err := mapstructure.Decode(cfg.Params, &params)
+	err := common.DecodeParams(cfg.Params, &params)
 	if err != nil {
 		return nil, fmt.Errorf("can't decode params: %w", err)
 	}
@@ -291,11 +288,16 @@ func NewReverseLookupRule(
 
 	rule := &ReverseLookupRule{
 		db:   db,
-		path: params.Path,
+		path: params.List.Origin(),
 		dns:  dns,
 	}
 
-	rule.list, err = getRegexpList(params.Path)
+	patternsStrings, err := params.List.Resolve()
+	if err != nil {
+		return nil, fmt.Errorf("invalid list attribute: %w", err)
+	}
+
+	rule.list, err = compileRegexpList(patternsStrings)
 	if err != nil {
 		return nil, fmt.Errorf("can't create regexp list: %w", err)
 	}
@@ -304,7 +306,7 @@ func NewReverseLookupRule(
 }
 
 type RegexpParams struct {
-	Path string `mapstructure:"list"`
+	List common.ListSource `yaml:"list"`
 }
 
 type RegexpRule struct {
@@ -341,7 +343,7 @@ func (f *RegexpRule) String() string {
 }
 
 type IPRuleParams struct {
-	Path string `mapstructure:"list"`
+	List common.ListSource `yaml:"list"`
 }
 
 type IPRule struct {
@@ -459,8 +461,8 @@ type GeoParam struct {
 }
 
 type GeoParams struct {
-	Path         string     `mapstructure:"list"`
-	Geolocations []GeoParam `mapstructure:"geolocations"`
+	List         common.ListSource `yaml:"list"`
+	Geolocations []GeoParam        `mapstructure:"geolocations"`
 }
 
 type GeoRegexp struct {
@@ -733,8 +735,8 @@ func (f *GeoRule) String() string {
 }
 
 type ReverseLookupParams struct {
-	DNS  string `mapstructure:"dns"`
-	Path string `mapstructure:"list"`
+	DNS  string            `mapstructure:"dns"`
+	List common.ListSource `yaml:"list"`
 }
 
 type ReverseLookupRule struct {

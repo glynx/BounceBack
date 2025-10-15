@@ -147,7 +147,8 @@ func (p *Proxy) oneSideHandler(
 		e.MU.Lock()
 		if ingress {
 			e.Content = append(e.Content, data...)
-			if !p.RunFilters(e, logger) && p.processVerdict(src, logger) {
+			isAllowed, _ := p.RunFilters(e, logger)
+			if !isAllowed && p.processVerdict(src, logger) {
 				e.MU.Unlock()
 				return nil
 			}
@@ -187,8 +188,13 @@ func (p *Proxy) handleConnection(src net.Conn) {
 		Content: []byte{},
 		From:    from,
 	}
-	if !p.RunFilters(e, logger) && p.processVerdict(src, logger) {
+	isAllowed, target := p.RunFilters(e, logger)
+	if !isAllowed && p.processVerdict(src, logger) {
 		return
+	}
+
+	if target == "" {
+		target = p.TargetURL.String()
 	}
 
 	var (
@@ -198,11 +204,11 @@ func (p *Proxy) handleConnection(src net.Conn) {
 	if p.IsTLS {
 		dst, err = tls.Dial(
 			"tcp",
-			p.TargetURL.String(),
+			target,
 			p.TLSConfig,
 		)
 	} else {
-		dst, err = net.Dial("tcp", p.TargetURL.String())
+		dst, err = net.Dial("tcp", target)
 	}
 	if err != nil {
 		logger.Error().Err(err).Msg("Failed to connect to target")

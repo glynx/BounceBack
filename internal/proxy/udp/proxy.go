@@ -190,12 +190,16 @@ func (p *Proxy) handleConnection(src *net.UDPAddr, data []byte) {
 		Content: data,
 		From:    from,
 	}
-	if !p.RunFilters(e, logger) && p.processVerdict(c, logger) {
+	isAllowed, target := p.RunFilters(e, logger)
+	if !isAllowed && p.processVerdict(c, logger) {
 		return
+	}
+	if target == "" {
+		target = p.TargetURL.String()
 	}
 
 	if !exist {
-		dst, err := net.Dial("udp", p.TargetURL.String())
+		dst, err := net.Dial("udp", target)
 		if err != nil {
 			logger.Error().Err(err).Msg("Failed to connect to target")
 			return
