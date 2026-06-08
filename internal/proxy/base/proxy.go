@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/D00Movenok/BounceBack/internal/audit"
 	"github.com/D00Movenok/BounceBack/internal/common"
 	"github.com/D00Movenok/BounceBack/internal/database"
 	"github.com/D00Movenok/BounceBack/internal/rules"
@@ -149,6 +150,8 @@ func (p *Proxy) RunFilters(e wrapper.Entity, logger zerolog.Logger) (bool, strin
 
 	mg := p.prepareRules(e, logger)
 	var acceptTarget string
+	var acceptRule string
+	var acceptRuleDescription string
 	// TODO: cache filters for equal entities for optimization.
 	for i, f := range p.Config.Filters {
 		mg[i].Lock()
@@ -176,23 +179,63 @@ func (p *Proxy) RunFilters(e wrapper.Entity, logger zerolog.Logger) (bool, strin
 		}
 		log.Msg("Running action")
 		if f.Action == common.FilterActionReject {
-			err = p.db.IncRejects(ip)
+			v, err := p.db.IncRejects(ip)
 			if err != nil {
 				logger.Error().Err(err).Msg("Can't increase rejects")
+			} else {
+				audit.Event("request_rejected").
+					Str("ip", ip).
+					Str("proxy", p.Config.Name).
+					Str("reason", "rule").
+					Str("rule", f.Rule).
+					Stringer("rule_description", rule).
+					Uint("accepts", v.Accepts).
+					Uint("rejects", v.Rejects).
+					Msg("request rejected")
+				if p.Config.RuleSettings.RejectThreshold > 0 &&
+					v.Rejects == p.Config.RuleSettings.RejectThreshold {
+					audit.Event("permanent_reject_added").
+						Str("ip", ip).
+						Str("proxy", p.Config.Name).
+						Str("rule", f.Rule).
+						Stringer("rule_description", rule).
+						Uint("accepts", v.Accepts).
+						Uint("rejects", v.Rejects).
+						Uint("reject_threshold", p.Config.RuleSettings.RejectThreshold).
+						Msg("ip reached permanent reject threshold")
+				}
 			}
 			mg[i].Unlock()
 			return false, ""
 		}
 
 		// accept action
+		acceptRule = f.Rule
+		acceptRuleDescription = rule.String()
 		mg[i].Unlock()
 		break
 	}
 
 	logger.Debug().Msg("Accepted")
-	err := p.db.IncAccepts(ip)
+	v, err := p.db.IncAccepts(ip)
 	if err != nil {
 		logger.Error().Err(err).Msg("Can't increase accepts")
+	} else if p.Config.RuleSettings.NoRejectThreshold > 0 &&
+		v.Accepts == p.Config.RuleSettings.NoRejectThreshold {
+		reason := "no_rejecting_rule"
+		if acceptRule != "" {
+			reason = "accept_rule"
+		}
+		audit.Event("permanent_accept_added").
+			Str("ip", ip).
+			Str("proxy", p.Config.Name).
+			Str("reason", reason).
+			Str("rule", acceptRule).
+			Str("rule_description", acceptRuleDescription).
+			Uint("accepts", v.Accepts).
+			Uint("rejects", v.Rejects).
+			Uint("noreject_threshold", p.Config.RuleSettings.NoRejectThreshold).
+			Msg("ip reached permanent accept threshold")
 	}
 
 	return true, acceptTarget
@@ -212,7 +255,18 @@ func (p *Proxy) isRejectedByThreshold(ip string, logger zerolog.Logger) bool {
 		logger.Debug().Msg("Non-rejected permanently")
 	case p.Config.RuleSettings.RejectThreshold > 0 &&
 		v.Rejects >= p.Config.RuleSettings.RejectThreshold:
-		logger.Warn().Msg("Rejected permanently")
+		logger.Warn().
+			Uint("rejects", v.Rejects).
+			Uint("reject_threshold", p.Config.RuleSettings.RejectThreshold).
+			Msg("Rejected permanently")
+		audit.Event("request_rejected").
+			Str("ip", ip).
+			Str("proxy", p.Config.Name).
+			Str("reason", "permanent_reject_threshold").
+			Uint("accepts", v.Accepts).
+			Uint("rejects", v.Rejects).
+			Uint("reject_threshold", p.Config.RuleSettings.RejectThreshold).
+			Msg("request rejected")
 		return true
 	default:
 	}

@@ -19,6 +19,84 @@ import (
 	"github.com/rs/zerolog"
 )
 
+type HeaderRegexpParams struct {
+	List common.ListSource `mapstructure:"list"`
+}
+
+type HeaderRegexpRule struct {
+	path string
+	list []*regexp.Regexp
+}
+
+func NewHeaderRegexpRule(
+	_ *database.DB,
+	_ RuleSet,
+	cfg common.RuleConfig,
+	_ common.Globals,
+) (Rule, error) {
+	var params HeaderRegexpParams
+
+	err := common.DecodeParams(cfg.Params, &params)
+	if err != nil {
+		return nil, fmt.Errorf("can't decode params: %w", err)
+	}
+
+	patternsStrings, err := params.List.Resolve()
+	if err != nil {
+		return nil, fmt.Errorf("invalid list attribute: %w", err)
+	}
+
+	rule := &HeaderRegexpRule{
+		path: params.List.Origin(),
+	}
+
+	rule.list, err = compileRegexpList(patternsStrings)
+	if err != nil {
+		return nil, fmt.Errorf("can't create regexp list: %w", err)
+	}
+
+	return rule, nil
+}
+
+func (f *HeaderRegexpRule) Prepare(
+	_ wrapper.Entity,
+	_ zerolog.Logger,
+) error {
+	return nil
+}
+
+func (f *HeaderRegexpRule) Apply(
+	e wrapper.Entity,
+	logger zerolog.Logger,
+) (bool, error) {
+	headers, err := e.GetHeaders()
+	if err != nil {
+		return false, fmt.Errorf("can't get headers: %w", err)
+	}
+
+	for _, r := range f.list {
+		for name, values := range headers {
+			canonical := http.CanonicalHeaderKey(name)
+			for _, value := range values {
+				headerLine := canonical + ": " + value
+				if r.MatchString(headerLine) || r.MatchString(value) {
+					logger.Debug().
+						Stringer("match", r).
+						Str("header", canonical).
+						Msg("Header regexp match")
+					return true, nil
+				}
+			}
+		}
+	}
+
+	return false, nil
+}
+
+func (f *HeaderRegexpRule) String() string {
+	return fmt.Sprintf("HeaderRegexp(list=%s)", f.path)
+}
+
 // TODO: add unit tests for malleable rule.
 func NewMalleableRule(
 	_ *database.DB,
@@ -309,9 +387,9 @@ func (f *MallebaleRule) verifyHTTPProfile(
 
 	for _, transform := range transforms {
 		if len(transform) == 0 {
-        	logger.Debug().Msg("empty transform chain encountered; skipping")
-        	continue
-    	}
+			logger.Debug().Msg("empty transform chain encountered; skipping")
+			continue
+		}
 		last := transform[len(transform)-1]
 		switch last.Func {
 		case "header":

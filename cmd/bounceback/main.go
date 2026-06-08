@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/netip"
 	"os"
 	"os/signal"
 	"syscall"
@@ -14,6 +15,7 @@ import (
 	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
 
+	"github.com/D00Movenok/BounceBack/internal/audit"
 	"github.com/D00Movenok/BounceBack/internal/common"
 	"github.com/D00Movenok/BounceBack/internal/database"
 	"github.com/D00Movenok/BounceBack/internal/proxy"
@@ -47,6 +49,21 @@ var (
 		"bounceback.log",
 		"Path to the log file",
 	)
+	auditLogFile = pflag.String(
+		"audit-log",
+		"bounceback-audit-events.jsonl",
+		"Path to the structured decision audit log",
+	)
+	storagePath = pflag.String(
+		"storage",
+		"storage",
+		"Path to the verdict storage directory",
+	)
+	removePermanentReject = pflag.String(
+		"remove-permanent-reject",
+		"",
+		"Clear the permanent reject state for an IP and exit",
+	)
 	verbose = pflag.CountP(
 		"verbose",
 		"v",
@@ -59,12 +76,18 @@ func main() {
 
 	initPflag()
 	initLogger()
+	initAuditLogger()
 	setLogLevel()
-	parseConfig()
 
 	db := createKeyValueStorage()
 	defer db.DB.Close()
 
+	if *removePermanentReject != "" {
+		clearPermanentReject(db, *removePermanentReject)
+		return
+	}
+
+	parseConfig()
 	cfg := parseProxyConfig()
 	log.Debug().Any("config", cfg).Msg("Parsed config")
 
@@ -118,6 +141,18 @@ func initLogger() {
 	)
 }
 
+func initAuditLogger() {
+	fileWriter, err := os.OpenFile(
+		*auditLogFile,
+		os.O_WRONLY|os.O_CREATE|os.O_APPEND,
+		0600,
+	)
+	if err != nil {
+		log.Fatal().Err(err).Msg("Can't create/open audit log file")
+	}
+	audit.Configure(fileWriter)
+}
+
 func setLogLevel() {
 	switch *verbose {
 	case 0:
@@ -144,11 +179,34 @@ func parseConfig() {
 
 func createKeyValueStorage() *database.DB {
 	log.Info().Msg("Creating storage")
-	db, err := database.New("storage", false)
+	db, err := database.New(*storagePath, false)
 	if err != nil {
 		log.Fatal().Err(err).Msg("Can't create key/value storage")
 	}
 	return db
+}
+
+func clearPermanentReject(db *database.DB, rawIP string) {
+	ip, err := netip.ParseAddr(rawIP)
+	if err != nil {
+		log.Fatal().Err(err).Str("ip", rawIP).Msg("Invalid IP address")
+	}
+	ip = ip.Unmap()
+
+	cleared, err := db.ClearRejects(ip.String())
+	if err != nil {
+		log.Fatal().Err(err).Stringer("ip", ip).Msg("Can't clear permanent reject")
+	}
+
+	audit.Event("permanent_reject_removed").
+		Stringer("ip", ip).
+		Uint("cleared_rejects", cleared).
+		Str("reason", "command_line").
+		Msg("permanent reject state removed")
+	log.Info().
+		Stringer("ip", ip).
+		Uint("cleared_rejects", cleared).
+		Msg("Permanent reject state removed")
 }
 
 func parseProxyConfig() *common.Config {

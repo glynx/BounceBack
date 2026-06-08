@@ -2,6 +2,7 @@ package database
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 
 	xdr "github.com/davecgh/go-xdr/xdr2"
@@ -70,4 +71,44 @@ func saveCache(db *DB, key string, prefix string, data any) error {
 		return fmt.Errorf("can't save cache: %w", err)
 	}
 	return nil
+}
+
+// updateCache atomically loads, mutates, and saves a cache value.
+func updateCache[T any](db *DB, key string, prefix string, update func(*T)) (*T, error) {
+	data := new(T)
+	var err error
+	for {
+		err = db.DB.Update(func(txn *badger.Txn) error {
+			v, err := txn.Get([]byte(prefix + key))
+			if err == nil {
+				b, err := v.ValueCopy(nil)
+				if err != nil {
+					return fmt.Errorf("can't copy value: %w", err)
+				}
+				if _, err = xdr.Unmarshal(bytes.NewReader(b), data); err != nil {
+					return fmt.Errorf("can't unmarshal value: %w", err)
+				}
+			} else if err != badger.ErrKeyNotFound {
+				return fmt.Errorf("can't get value from storage: %w", err)
+			}
+
+			update(data)
+
+			var w bytes.Buffer
+			if _, err = xdr.Marshal(&w, data); err != nil {
+				return fmt.Errorf("can't marshal value: %w", err)
+			}
+			if err = txn.Set([]byte(prefix+key), w.Bytes()); err != nil {
+				return fmt.Errorf("can't save value to storage: %w", err)
+			}
+			return nil
+		})
+		if !errors.Is(err, badger.ErrConflict) {
+			break
+		}
+	}
+	if err != nil {
+		return nil, fmt.Errorf("can't update cache: %w", err)
+	}
+	return data, nil
 }

@@ -260,6 +260,176 @@ func TestBase_RegexpRule(t *testing.T) {
 	}
 }
 
+func TestBase_HeaderRegexpRule(t *testing.T) {
+	type args struct {
+		headers       map[string][]string
+		getHeadersErr error
+		cfg           common.RuleConfig
+	}
+	type want struct {
+		res        bool
+		createErr  bool
+		prepareErr bool
+		applyErr   bool
+	}
+	tests := []struct {
+		name string
+		args args
+		want want
+	}{
+		{
+			"header regexp matches header line",
+			args{
+				headers: map[string][]string{
+					"user-agent": []string{"curl/7.79.1"},
+					"X-Test":     []string{"value"},
+				},
+				cfg: common.RuleConfig{
+					Name: "test",
+					Type: "header_regexp",
+					Params: map[string]any{
+						"list": []string{"(?i)^User-Agent:.*curl"},
+					},
+				},
+			},
+			want{
+				res:        true,
+				createErr:  false,
+				prepareErr: false,
+				applyErr:   false,
+			},
+		},
+		{
+			"header regexp matches header value",
+			args{
+				headers: map[string][]string{
+					"User-Agent": []string{"curl/7.79.1"},
+				},
+				cfg: common.RuleConfig{
+					Name: "test",
+					Type: "header_regexp",
+					Params: map[string]any{
+						"list": []string{"(?i)curl/7\\.79"},
+					},
+				},
+			},
+			want{
+				res:        true,
+				createErr:  false,
+				prepareErr: false,
+				applyErr:   false,
+			},
+		},
+		{
+			"header regexp no match",
+			args{
+				headers: map[string][]string{
+					"User-Agent": []string{"curl/7.79.1"},
+				},
+				cfg: common.RuleConfig{
+					Name: "test",
+					Type: "header_regexp",
+					Params: map[string]any{
+						"list": []string{"^Authorization: Bearer"},
+					},
+				},
+			},
+			want{
+				res:        false,
+				createErr:  false,
+				prepareErr: false,
+				applyErr:   false,
+			},
+		},
+		{
+			"header regexp get headers error",
+			args{
+				headers:       nil,
+				getHeadersErr: errors.New("some error"),
+				cfg: common.RuleConfig{
+					Name: "test",
+					Type: "header_regexp",
+					Params: map[string]any{
+						"list": []string{"(?i)^User-Agent"},
+					},
+				},
+			},
+			want{
+				res:        false,
+				createErr:  false,
+				prepareErr: false,
+				applyErr:   true,
+			},
+		},
+		{
+			"header regexp invalid regex",
+			args{
+				headers: nil,
+				cfg: common.RuleConfig{
+					Name: "test",
+					Type: "header_regexp",
+					Params: map[string]any{
+						"list": []string{"["},
+					},
+				},
+			},
+			want{
+				res:        false,
+				createErr:  true,
+				prepareErr: false,
+				applyErr:   false,
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rule, err := rules.NewHeaderRegexpRule(
+				nil,
+				rules.RuleSet{},
+				tt.args.cfg,
+				common.Globals{},
+			)
+			require.Equalf(
+				t,
+				tt.want.createErr,
+				err != nil,
+				"NewHeaderRegexpRule() error mismatch: %s",
+				err,
+			)
+
+			if !tt.want.createErr {
+				e := new(MockEntity)
+				e.On("GetHeaders").Return(tt.args.headers, tt.args.getHeadersErr)
+
+				err = rule.Prepare(e, log.Logger)
+				require.Equalf(
+					t,
+					tt.want.prepareErr,
+					err != nil,
+					"Prepare() error mismatch: %s",
+					err,
+				)
+
+				res, err := rule.Apply(e, log.Logger)
+				require.Equalf(
+					t,
+					tt.want.applyErr,
+					err != nil,
+					"Apply() error mismatch: %s",
+					err,
+				)
+				require.Equal(
+					t,
+					tt.want.res,
+					res,
+					"Apply() result mismatch",
+				)
+				e.AssertExpectations(t)
+			}
+		})
+	}
+}
+
 func TestBase_IPRule(t *testing.T) {
 	type args struct {
 		ip  string
@@ -893,7 +1063,7 @@ func TestBase_GeoRule(t *testing.T) {
 					Name: "test",
 					Type: "geo",
 					Params: map[string]any{
-						"list": "",
+						"list": []map[string][]string{},
 						"geolocations": []map[string][]string{
 							{
 								"organisation": []string{"(?i)google"},
@@ -917,7 +1087,7 @@ func TestBase_GeoRule(t *testing.T) {
 					Name: "test",
 					Type: "geo",
 					Params: map[string]any{
-						"list": "",
+						"list": []map[string][]string{},
 						"geolocations": []map[string][]string{
 							{
 								"country": []string{"(?i)united states"},
@@ -989,7 +1159,7 @@ func TestBase_GeoRule(t *testing.T) {
 					Name: "test",
 					Type: "geo",
 					Params: map[string]any{
-						"list": "",
+						"list": []map[string][]string{},
 						"geolocations": []map[string][]string{
 							{
 								"organisation": []string{"some false org"},
@@ -1013,7 +1183,7 @@ func TestBase_GeoRule(t *testing.T) {
 					Name: "test",
 					Type: "geo",
 					Params: map[string]any{
-						"list": "",
+						"list": []map[string][]string{},
 						"geolocations": []map[string][]string{
 							{
 								"country": []string{"some false regexp"},
@@ -1061,7 +1231,7 @@ func TestBase_GeoRule(t *testing.T) {
 					Name: "test",
 					Type: "geo",
 					Params: map[string]any{
-						"list": "",
+						"list": []map[string][]string{},
 						"geolocations": []map[string][]string{
 							{
 								"organisation": []string{},
@@ -1086,7 +1256,7 @@ func TestBase_GeoRule(t *testing.T) {
 					Name: "test",
 					Type: "geo",
 					Params: map[string]any{
-						"list": "",
+						"list": []map[string][]string{},
 						"geolocations": []map[string][]string{
 							{
 								"organisation": []string{"(?i"},

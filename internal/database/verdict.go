@@ -31,20 +31,36 @@ func (db *DB) GetVerdict(ip string) (*Verdict, error) {
 	return v, nil
 }
 
-func (db *DB) IncAccepts(ip string) error {
-	v, err := db.GetVerdict(ip)
+func (db *DB) IncAccepts(ip string) (*Verdict, error) {
+	v, err := updateCache(db, ip, VerdictPrefix, func(v *Verdict) {
+		v.Accepts++
+	})
 	if err != nil {
-		return fmt.Errorf("can't get verdicts for accepts inc: %w", err)
+		return nil, fmt.Errorf("can't increase accepts: %w", err)
 	}
-	v.Accepts++
-	return saveCache(db, ip, VerdictPrefix, v)
+	return v, nil
 }
 
-func (db *DB) IncRejects(ip string) error {
-	v, err := db.GetVerdict(ip)
+func (db *DB) IncRejects(ip string) (*Verdict, error) {
+	v, err := updateCache(db, ip, VerdictPrefix, func(v *Verdict) {
+		v.Rejects++
+	})
 	if err != nil {
-		return fmt.Errorf("can't get verdicts for rejects inc: %w", err)
+		return nil, fmt.Errorf("can't increase rejects: %w", err)
 	}
-	v.Rejects++
-	return saveCache(db, ip, VerdictPrefix, v)
+	return v, nil
+}
+
+// ClearRejects removes an IP's permanent-reject state without changing its
+// accept history. It returns the number of rejects that were cleared.
+func (db *DB) ClearRejects(ip string) (uint, error) {
+	var previous uint
+	_, err := updateCache(db, ip, VerdictPrefix, func(v *Verdict) {
+		previous = v.Rejects
+		v.Rejects = 0
+	})
+	if err != nil {
+		return 0, fmt.Errorf("can't reset rejects: %w", err)
+	}
+	return previous, nil
 }

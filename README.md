@@ -85,6 +85,37 @@ goreleaser release --clean --snapshot
     ```
 
     > Usage of BounceBack: \
+    > --audit-log string    Path to the structured decision audit log (default "bounceback-audit-events.jsonl") \
     > -c, --config string   Path to the config file in YAML format (default "config.yml") \
     > -l, --log string      Path to the log file (default "bounceback.log") \
+    > --remove-permanent-reject string   Clear the permanent reject state for an IP and exit \
+    > --storage string      Path to the verdict storage directory (default "storage") \
     > -v, --verbose count   Verbose logging (0 = info, 1 = debug, 2+ = trace)
+
+### Permanent verdict maintenance
+
+Permanent accept and reject decisions are derived from counters in the verdict
+storage. To remove an IP from the permanent reject state while preserving its
+accept history, stop the running BounceBack instance and run:
+
+```bash
+./bounceback --remove-permanent-reject 192.0.2.1
+```
+
+Use `--storage` when the verdict storage is not in the default `storage`
+directory. The running instance must be stopped because Badger permits only one
+process to open the storage.
+
+### Decision audit log
+
+BounceBack writes decision audit events as JSON Lines to
+`bounceback-audit-events.jsonl` by default. Use `--audit-log` to select another path.
+The audit records include timestamps and fields such as `event`, `ip`, `proxy`,
+`rule`, `reason`, verdict counters, and configured thresholds.
+
+Recorded events include:
+
+- `request_rejected`
+- `permanent_reject_added`
+- `permanent_accept_added`
+- `permanent_reject_removed`

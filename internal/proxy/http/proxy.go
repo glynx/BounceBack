@@ -93,7 +93,8 @@ func NewProxy(
 		ForceAttemptHTTP2:   true, // harmless for WS (handled via H1), good for normal requests
 		TLSHandshakeTimeout: 10 * time.Second,
 		// ResponseHeaderTimeout protects only the initial response headers (e.g., WS handshake).
-		ResponseHeaderTimeout: 10 * time.Second,
+		// Use the configured timeout so long-polling can extend this window.
+		ResponseHeaderTimeout: baseProxy.Config.Timeout,
 		IdleConnTimeout:       120 * time.Second,
 		MaxIdleConns:          256,
 		MaxIdleConnsPerHost:   64,

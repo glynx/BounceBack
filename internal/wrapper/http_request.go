@@ -25,13 +25,17 @@ func (r *HTTPRequest) GetIP() netip.Addr {
 
 	xForwardedFor := r.Request.Header.Get("X-Forwarded-For")
 	if !addr.IsValid() && xForwardedFor != "" {
-		ip := strings.Split(xForwardedFor, ",")[0]
-		addr, _ = netip.ParseAddr(ip)
+		addr = parseForwardedIP(strings.Split(xForwardedFor, ",")[0])
 	}
 
 	xRealIP := r.Request.Header.Get("X-Real-Ip")
 	if !addr.IsValid() && xRealIP != "" {
-		addr, _ = netip.ParseAddr(xRealIP)
+		addr = parseForwardedIP(xRealIP)
+	}
+
+	xClientIP := r.Request.Header.Get("X-Client-Ip")
+	if !addr.IsValid() && xClientIP != "" {
+		addr = parseForwardedIP(xClientIP)
 	}
 
 	if !addr.IsValid() {
@@ -40,6 +44,17 @@ func (r *HTTPRequest) GetIP() netip.Addr {
 	}
 
 	return addr.Unmap()
+}
+
+func parseForwardedIP(value string) netip.Addr {
+	value = strings.TrimSpace(value)
+	if addr, err := netip.ParseAddr(value); err == nil {
+		return addr
+	}
+	if addrPort, err := netip.ParseAddrPort(value); err == nil {
+		return addrPort.Addr()
+	}
+	return netip.Addr{}
 }
 
 func (r *HTTPRequest) GetRaw() ([]byte, error) {

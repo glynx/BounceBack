@@ -17,8 +17,9 @@ func GetRuleBase() map[string]RuleBaseCreator {
 		"geo":            NewGeolocationRule,
 		"reverse_lookup": NewReverseLookupRule,
 		// packet inspection
-		"regexp":    NewRegexpRule,
-		"malleable": NewMalleableRule,
+		"regexp":        NewRegexpRule,
+		"header_regexp": NewHeaderRegexpRule,
+		"malleable":     NewMalleableRule,
 		// misc
 		"time": NewTimeRule,
 	}
